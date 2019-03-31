@@ -743,7 +743,7 @@ elif type(node) == Node.Extension:
         # Берем информацию об удаленном Branch-узле.
         stored_path, stored_ref = info
 
-        # Смотрим, на что же хранил этот Branch-узел.
+        # Смотрим, что же хранил этот Branch-узел.
         child = self._get_node(stored_ref)
 
         new_node = None
@@ -766,6 +766,133 @@ elif type(node) == Node.Extension:
 ```
 
 #### `if type(node) == Node.Branch`
+
+Вот и конец. Ну, почти. Если мы удаляем Branch-узел, то вещи становятся несколько запутанными... 
+Почему? Потому что Branch-узел одновременно может выступать в роли Leaf-узла (хранить значение) и в роли набора Extension-узлов (хранить ссылки на другие узлы).
+Соответственно, в результате удаления данный узел может стать ненужным. Если в нём не останется ссылок, но останется значение -- ему на замену придет Leaf-узел. Если в нём нет значения и останется одна ссылка -- его нужно будет заменить на Extension-узел. Если же останется хотя бы одна ссылка и значение, либо не будет значения, но ссылок сохранится 2 и более -- то Branch-узел будет просто обновлен.
+
+И как нам это распутывать? Давайте разбираться:
+
+Сперва разбираемся с удалением:
+
+1. Если путь уже пуст, удаляем хранимое значение.
+2. Если путь не пуст, вызываем `_delete` для соответствующей ветки.
+
+В коде это выглядит вот так:
+
+```python
+elif type(node) == Node.Branch:
+    action = None
+    idx = None
+    info = None
+
+    if len(path) == 0 and len(node.data) == 0:
+        raise KeyError
+    elif len(path) == 0 and len(node.data) != 0:
+        node.data = b''
+        action = MerklePatriciaTrie._DeleteAction.DELETED
+    else:
+        # Сохраняем индекс ветки, с которой мы работаем. Он нам понадобится позже.
+        idx = path.at(0)
+
+        if len(node.branches[idx]) == 0:
+            raise KeyError
+
+        action, info = self._delete(node.branches[idx], path.consume(1))
+
+        # Обозначаем ветку, с которой работали, как пустую. Если действием окажется не удаление - на это место
+        # будет добавлена обновленная ссылка.
+        node.branches[idx] = b''
+```
+
+В результате мы имеем `_DeleteAction` и можем начать разбираться с текущим узлом.
+
+1. Если произошло обновление узла или нижележащий Branch-узел стал ненужным, наш узел гарантированно остается нужным (не было ни удаления значения, ни удаления веток). В таком случае нам нужно просто обновлить ссылку в ветке по индексу.
+
+```python
+if action == MerklePatriciaTrie._DeleteAction.UPDATED:
+    # Just update reference.
+    next_ref = info
+    node.branches[idx] = next_ref
+    reference = self._store_node(node)
+    return MerklePatriciaTrie._DeleteAction.UPDATED, reference
+elif action == MerklePatriciaTrie._DeleteAction.USELESS_BRANCH:
+    # Just update reference.
+    _, next_ref = info
+    node.branches[idx] = next_ref
+    reference = self._store_node(node)
+    return MerklePatriciaTrie._DeleteAction.UPDATED, reference
+```
+
+2. Если же произошло удаление (либо данных, либо ветки), нам необходимо проверить, не стал ли наш узел ненужным.
+
+Для этого подсчитаем количество непустых веток. Возможные варианты:
+- Нет ни одной ветки и нет данных. Если честно, я не думаю, что такой вариант возможен, но будем обрабатывать его на всякий случай. Защитное программирование, все дела.
+- Все ветки пустые, но есть данные. Нужно создать Leaf-узел с этими данными. Обработают его выше по стеку вызовов.
+- Данных нет, осталась одна ветка. Нужно создать новый узел, исходя из того, что именно хранится в этой ветке.
+- Если вышеописанное неверно, значит, наш Branch-узел по прежнему нужен. Сохраняем его и говорим, что `_DeleteAction` -- `UPDATED`.
+
+```python
+if action == MerklePatriciaTrie._DeleteAction.DELETED:
+    non_empty_count = sum(map(lambda x: 1 if len(x) > 0 else 0, node.branches))
+
+    if non_empty_count == 0 and len(node.data) == 0:
+        # Branch node is empty, just delete it.
+        return MerklePatriciaTrie._DeleteAction.DELETED, None
+    elif non_empty_count == 0 and len(node.data) != 0:
+        # No branches, just value.
+        path = NibblePath([])
+        reference = self._store_node(Node.Leaf(path, node.data))
+
+        return MerklePatriciaTrie._DeleteAction.USELESS_BRANCH, (path, reference)
+    elif non_empty_count == 1 and len(node.data) == 0:
+        # No value and one branch
+        return self._build_new_node_from_last_branch(node.branches)
+    else:
+        # Branch has value and 1+ branches or no value and 2+ branches.
+        # It isn't useless, so action is `UPDATED`.
+        reference = self._store_node(node)
+        return MerklePatriciaTrie._DeleteAction.UPDATED, reference
+```
+
+Метод `_build_new_node_from_last_branch` находит ту самую единственную ветку и создает из неё новый узел.
+Если нижележащий узел -- Leaf или Extension, то нам нужно добавить в начало хранимого в них пути ниббл, соотвтетствующий индексу ветки.
+Если же нижележащий узел -- Branch, то нам нужно создать дополнительный Extension узел, путь в котором будет состоять из одного ниббла, а ссылка будет вести на Branch.
+
+```python
+def _build_new_node_from_last_branch(self, branches):
+    # Ищем индекс последней ветки.
+    idx = 0
+    for i in range(len(branches)):
+        if len(branches[i]) > 0:
+            idx = i
+            break
+
+    # Создаем из этого ниббла путь.
+    prefix_nibble = NibblePath([idx], offset=1)
+
+    # Смотрим на нижележащий узел
+    child = self._get_node(branches[idx])
+
+    path = None
+    node = None
+
+    # Создаем новый узел.
+    if type(child) == Node.Leaf:
+        path = NibblePath.combine(prefix_nibble, child.path)
+        node = Node.Leaf(path, child.data)
+    elif type(child) == Node.Extension:
+        path = NibblePath.combine(prefix_nibble, child.path)
+        node = Node.Extension(path, child.next_ref)
+    elif type(child) == Node.Branch:
+        path = prefix_nibble
+        node = Node.Extension(path, branches[idx])
+
+    # Завершаем работу.
+    reference = self._store_node(node)
+
+    return MerklePatriciaTrie._DeleteAction.USELESS_BRANCH, (path, reference)
+```
 
 ### Остальное
 
