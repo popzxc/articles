@@ -482,87 +482,137 @@ class MerklePatriciaTrie:
 
 ##### `if type(node) == Node.Leaf`
 
+Сперва разберемся с Leaf узлами. С ними возможны всего 2 сценария:
+
+1. Остаток пути, по которому мы идём, полностью совпадает с путём, хранящимся в Leaf-узле. В таком случае нам нужно просто поменять значение, сохранить новый узел и вернуть ссылку на него.
+
+2. Пути отличаются. В таком случае нужно создать Branch узел, который разделит эти два пути. Если один из путей пуст -- то его значение перекочует непосредственно в Branch-узел. В противном случае, нам придется создать два Leaf-узла, укороченных на длину общей части путей + 1 ниббл (этот ниббл будет обозначен индексом соответствующей ветки Branch-ноды).
+
+Также нужно будет проверить, есть ли общая часть пути, чтобы понять, нужно ли нам создавать ещё и Extension-узел. 
+
+Схематично это можно изобразить так:
+
+[картинка с вставкой узла и разделеним его на четыре новых: extension, branch, leaf и leaf]
+
+В коде это будет выглядеть так:
+
 ```python
 if type(node) == Node.Leaf:
-    # If we're updating the leaf there are 2 possible ways:
-    # 1. Path is equals to the rest of the key. Then we should just update value of this leaf.
-    # 2. Path differs. Then we should split this node into several nodes.
-
     if node.path == path:
-        # Path is the same. Just change the value.
+        # Пути совпадают. Просто обновляем значение и сохраняем новый узел.
         node.data = value
         return self._store_node(node)
 
-    # If we are here, we have to split the node.
+    # Нам нужно разделить узлы.
 
-    # Find the common part of the key and leaf's path.
+    # Ищем общую часть путей.
     common_prefix = path.common_prefix(node.path)
 
-    # Cut off the common part.
+    # Обрезаем общую часть от обоих путей.
     path.consume(len(common_prefix))
     node.path.consume(len(common_prefix))
 
-    # Create branch node to split paths.
+    # Создаем Branch узел.
     branch_reference = self._create_branch_node(path, value, node.path, node.data)
 
-    # If common part isn't empty, we have to create an extension node before branch node.
-    # Otherwise, we need just branch node.
+    # Проверяем, нужен ли нам Extension-узел.
     if len(common_prefix) != 0:
         return self._store_node(Node.Extension(common_prefix, branch_reference))
     else:
         return branch_reference
 ```
 
+Процедура `_create_branch_node` выглядит следующим образом:
+
+```python
+def _create_branch_node(self, path_a, value_a, path_b, value_b):
+    # Создаем ветки для Branch-узла.
+    branches = [b''] * 16
+
+    # Определяем, будут ли в нашем Branch-узле данные.
+    branch_value = b''
+    if len(path_a) == 0:
+        branch_value = value_a
+    elif len(path_b) == 0:
+        branch_value = value_b
+
+    # Создаем внутри веток Leaf-узлы, если необходимо.
+    self._create_branch_leaf(path_a, value_a, branches)
+    self._create_branch_leaf(path_b, value_b, branches)
+
+    # Сохраняем Branch-узел и возвращаем на него ссылку.
+    return self._store_node(Node.Branch(branches, branch_value))
+
+
+def _create_branch_leaf(self, path, value, branches):
+    # Смотрим, нужен ли нам вообще Leaf-узел.
+    if len(path) > 0:
+        # Берем первый ниббл (индекс ветки).
+        idx = path.at(0)
+
+        # Создаем Leaf-узел с остатком пути и складываем его в соответствующую ветку.
+        leaf_ref = self._store_node(Node.Leaf(path.consume(1), value))
+        branches[idx] = leaf_ref
+```
+
 ##### `if type(node) == Node.Extension`
+
+В случае с Extension-узлом всё похоже на Leaf-узел. 
+
+1. Если путь из Extension-узла является префиксом для нашего пути -- просто рекурсивно движемся дальше.
+
+2. В противном случае нам нужно сделать разделение с использованием Branch-узла, как и в вышеописанном случае.
+
+[картинка с разделением]
+
+Соответственно, код:
 
 ```python
 elif type(node) == Node.Extension:
-    # If we're updating an extenstion there are 2 possible ways:
-    # 1. Key starts with the extension node's path. Then we just go ahead and all the work will be done there.
-    # 2. Key doesn't start with extension node's path. Then we have to split extension node.
-
     if path.starts_with(node.path):
-        # Just go ahead.
+        # Просто движемся дальше и обновляем ссылку в текущем узле.
         new_reference = self._update(node.next_ref, path.consume(len(node.path)), value)
         return self._store_node(Node.Extension(node.path, new_reference))
 
-    # Split extension node.
+    # Разделяем Extension-узел.
 
-    # Find the common part of the key and extension's path.
+    # Находим общую часть для путей.
     common_prefix = path.common_prefix(node.path)
 
-    # Cut off the common part.
+    # Делаем обрезание.
     path.consume(len(common_prefix))
     node.path.consume(len(common_prefix))
 
-    # Create an empty branch node. It may have or have not the value depending on the length
-    # of the rest of the key.
+    # Создаем Branch-узел и, если нужно, добавляем в него значение.
     branches = [b''] * 16
     branch_value = value if len(path) == 0 else b''
 
-    # If needed, create leaf branch for the value we're inserting.
+    # По необходимости создаем дочерние Leaf- и Extension- узлы.
     self._create_branch_leaf(path, value, branches)
     # If needed, create an extension node for the rest of the extension's path.
     self._create_branch_extension(node.path, node.next_ref, branches)
 
     branch_reference = self._store_node(Node.Branch(branches, branch_value))
 
-    # If common part isn't empty, we have to create an extension node before branch node.
-    # Otherwise, we need just branch node.
+    # Проверяем, нужен ли нам Extension-узел.
     if len(common_prefix) != 0:
         return self._store_node(Node.Extension(common_prefix, branch_reference))
     else:
         return branch_reference
 ```
 
+Процедура `_create_branch_extension` логически эквивалентна процедуре `_create_branch_leaf`, но работает с Extension-узлом.
+
 ##### `if type(node) == Node.Branch`
+
+А вот с Branch-узлом всё просто. Если путь пустой -- мы просто сохраняем в текущем Branch-узле новое значение. Если же путь не пустой - "откусываем" от него один ниббл и рекурсивно идём ниже.
+
+[картинка с разделением]
+
+Код, думаю, в комментариях не нуждается.
 
 ```python
 elif type(node) == Node.Branch:
-    # For branch node things are easy.
-    # 1. If key is empty, just store value in this node.
-    # 2. If key isn't empty, just call `_update` with appropiate branch reference.
-
     if len(path) == 0:
         return self._store_node(Node.Branch(node.branches, value))
 
