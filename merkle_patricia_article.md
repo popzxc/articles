@@ -14,6 +14,16 @@ _"Какого дьявола я должен помнить наизусть в
 
 _Disclaimer: основным источником информации при реализации для меня являлись [Yellow paper](https://ethereum.github.io/yellowpaper/paper.pdf), а также исходные коды [parity-ethereum](https://github.com/paritytech/parity-ethereum) и [go-ethereum](https://github.com/ethereum/go-ethereum). Теоретической информации по поводу обоснования тех или иных решений было минимум, поэтому все выводы по поводу причин принятия тех или иных решений - мои личные. В случае, если я в чем-то заблуждаюсь - буду рад исправлениям в комментариях._
 
+## TL;DR
+
+Статья получилась довольно большой, поэтому ...
+
+TODO
+
+- Картинка с определеним MPT из Yellow Paper.
+- Ссылка на репозиторий.
+- Установка с помощью pip для пощупать-поиграть.
+
 ## Что это?
 
 _Дерево_ - структура данных, представляющая собой связный ациклический граф. Тут всё просто, все с этим знакомы.
@@ -692,13 +702,68 @@ class MerklePatriciaTrie:
 
 ```python
 if type(node) == Node.Leaf:
-    if len(path) == 0 or path == node.path:
+    if path == node.path:
         return MerklePatriciaTrie._DeleteAction.DELETED, None
     else:
         raise KeyError
 ```
 
+На всякий случай напомню, что "удаление" -- не совсем настоящее удаление. Старые узлы остаются в хранилище и доступны, если создать дерево от старого корня. А вот в дереве от нового корня мы этот узел уже найти не сможем.
+
 #### `if type(node) == Node.Extension`
+
+C Extension-узлом программа действий следующая:
+
+1. Сперва проверяем, является ли сохраненный в Extension-узле путь префиксом для пути удаляемого узла. Если нет -- искомый ключ отсутствует в дереве.
+2. Рекурсивно вызываем `_delete`, "откусив" нужную часть пути.
+3. Смотрим на произошедшее действие. Возможные варианты:
+
+- Следующий узел был удален. Тогда со спокойной совестью удаляем также и текущий узел.
+- Следующий узел был обновлен. Тогда мы просто меняем сохраненную ссылку.
+- Следующий узел был ставшим ненужным Branch-узлом. В таком случае мы должны создать вспомогательный узел вместо текущего. Тип нового узла зависит от того, почему Branch-узел стал не нужен. Если в нём не осталось веток, но было значение, то мы создаем Leaf-узел. В противном случае -- мы создаем Extension-узел.
+
+В коде это выглядит так:
+
+```python
+elif type(node) == Node.Extension:
+    if not path.starts_with(node.path):
+        raise KeyError
+
+    # Рекурсивно продолжаем удаление. Получаем тип действия и соответствующую ему информацию.
+    action, info = self._delete(node.next_ref, path.consume(len(node.path)))
+
+    if action == MerklePatriciaTrie._DeleteAction.DELETED:
+        return action, None
+    elif action == MerklePatriciaTrie._DeleteAction.UPDATED:
+        # Берем из информации ссылку, которую мы теперь должны хранить.
+        child_ref = info
+        new_ref = self._store_node(Node.Extension(node.path, child_ref))
+        return action, new_ref
+    elif action == MerklePatriciaTrie._DeleteAction.USELESS_BRANCH:
+        # Берем информацию об удаленном Branch-узле.
+        stored_path, stored_ref = info
+
+        # Смотрим, на что же хранил этот Branch-узел.
+        child = self._get_node(stored_ref)
+
+        new_node = None
+        if type(child) == Node.Leaf:
+            # В branch-узле были данные. Объединяем пути и создаем Leaf-узел вместо Extension.
+            path = NibblePath.combine(node.path, child.path)
+            new_node = Node.Leaf(path, child.data)
+        elif type(child) == Node.Extension:
+            # В Branch-узле хранился Extension-узел. Просто объединяем эти два пути в один.
+            path = NibblePath.combine(node.path, child.path)
+            new_node = Node.Extension(path, child.next_ref)
+        elif type(child) == Node.Branch:
+            # В Branch-узле была ссылка на ещё один Branch-узел. Добавляем к нашему Extension-узлу
+            # ещё один ниббл и обновляем ссылку.
+            path = NibblePath.combine(node.path, stored_path)
+            new_node = Node.Extension(path, stored_ref)
+
+        new_reference = self._store_node(new_node)
+        return MerklePatriciaTrie._DeleteAction.UPDATED, new_reference
+```
 
 #### `if type(node) == Node.Branch`
 
